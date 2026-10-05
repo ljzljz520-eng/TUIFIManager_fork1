@@ -90,6 +90,20 @@ class Anchor:
     left   : bool
     right  : bool
 
+
+@dataclass
+class MouseEventCache:
+    """Per-owner cache of the single KEY_MOUSE event returned by getmouse().
+
+    A curses KEY_MOUSE event can only be read once per event-loop iteration,
+    so pads, drawables and nested components of the same owner share one
+    cache object.  Each TUIFIManager owns its own cache (see ManagerContext)
+    instead of relying on process-wide Component class attributes.
+    """
+    was_read : bool  = False
+    event    : tuple = None # (id, x, y, z, bstate) as returned by getmouse()
+
+
 class Parent:
     def __init__(self,win):
         self.win = win
@@ -251,11 +265,11 @@ class Events:
 
 
 class Component(Events):
-    __mouse_was_read = False
     __colors_initialized = False
 
-    def __init__(self, win=None, y=0, x=0, height=0, width=0, anchor=(False, False, False, False), iheight=None, iwidth=None, warp=True, border:Border=None, visibility=True) -> None:
+    def __init__(self, win=None, y=0, x=0, height=0, width=0, anchor=(False, False, False, False), iheight=None, iwidth=None, warp=True, border:Border=None, visibility=True, mouse_cache=None) -> None:
         super().__init__()
+        self.mouse_cache       = mouse_cache or MouseEventCache()
         self.parent            = Parent(win or uc.stdscr)
         self.position          = Position (y, x)
         self.size              = Size(height, width, iheight or height, iwidth or width)
@@ -273,7 +287,7 @@ class Component(Events):
 
 
     def refresh(self, redraw_parent=False):
-        Component.__mouse_was_read = False
+        self.mouse_cache.was_read = False
 
 
     def hide(self): self.visibility = False
@@ -354,11 +368,13 @@ class Component(Events):
 
 
     def get_mouse(self):
-        if not Component.__mouse_was_read:
-            Component.id, Component._x, Component._y, Component._z, Component.bstate = uc.getmouse()
-            Component.__mouse_was_read = True
-        Component.in_range = self._in_range()
-        return (Component.in_range, Component.id, Component._x, Component._y, Component._z, Component.bstate )
+        cache = self.mouse_cache
+        if not cache.was_read:
+            cache.event = uc.getmouse()
+            cache.was_read = True
+        _id, _x, _y, _z, bstate = cache.event
+        in_range = self._in_range()
+        return (in_range, _id, _x, _y, _z, bstate)
 
 
     def handle_events(self, event, redraw_parent=True):
@@ -475,8 +491,8 @@ class Component(Events):
 class WindowPad(Component):
     update = False
 
-    def __init__(self, win=None, y=0, x=0, height=0, width=0, anchor=(False, False, False, False), is_focused=False, iheight=None, iwidth=None, warp=True, border:Border=None) -> None:
-        super().__init__(win, y, x, height, width, anchor, iheight, iwidth, warp, border)
+    def __init__(self, win=None, y=0, x=0, height=0, width=0, anchor=(False, False, False, False), is_focused=False, iheight=None, iwidth=None, warp=True, border:Border=None, mouse_cache=None) -> None:
+        super().__init__(win, y, x, height, width, anchor, iheight, iwidth, warp, border, mouse_cache=mouse_cache)
         self.pad               = uc.newpad(height, width)
         self.is_focused        = is_focused
         self.components        = []
@@ -525,9 +541,10 @@ class WindowPad(Component):
 
 
     def _in_range(self):
-        return (
-            self.x <= Component._x < self.x + self.width
-            and self.y <= Component._y < self.y + self.height
+        event = self.mouse_cache.event
+        return event is not None and (
+            self.x <= event[1] < self.x + self.width
+            and self.y <= event[2] < self.y + self.height
         )
 
     def handle_events(self, event, redraw_parent=True): #  prevent multiple if conditions for drawable components too
@@ -558,14 +575,15 @@ class WindowPad(Component):
 class Drawable(Component):
     def __init__(self,winpad:WindowPad, y=0, x=0, height=1, width=45, anchor=(False, False, False, False) ) -> None:
         self.winpad = winpad
-        super().__init__(winpad.pad, y, x, height, width, anchor)
-        self.__add_component_to(winpad) 
+        super().__init__(winpad.pad, y, x, height, width, anchor, mouse_cache=winpad.mouse_cache)
+        self.__add_component_to(winpad)
 
 
     def _in_range(self):
-        return (
-            self.winpad.x+self.x <= Component._x < self.winpad.x + self.x + self.width 
-            and self.winpad.y+self.y <= Component._y < self.winpad.y + self.y + self.height
+        event = self.mouse_cache.event
+        return event is not None and (
+            self.winpad.x+self.x <= event[1] < self.winpad.x + self.x + self.width
+            and self.winpad.y+self.y <= event[2] < self.winpad.y + self.y + self.height
         )
 
 

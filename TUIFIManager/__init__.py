@@ -16,9 +16,9 @@ from       .TUIFile import TUIFile
 from      .TUIProps import TUIProps, convert_bytes
 from   .TUItilities import WindowPad, Label, END_MOUSE, BEGIN_MOUSE, BEGIN_MOUSE, END_MOUSE, IS_WINDOWS, HOME_DIR, IS_TERMUX, TEMP_PATH, DEFAULT_COLORS, COLOR_PAIR_RED, COLOR_PAIR_WHITE, COLOR_PAIR_BW, COLOR_PAIR_GREEN, clipboard # DEFAULT_COLORS is imported from __main__
 from  .TUIFIProfile import TUIFIProfiles, DEFAULT_PROFILE , DEFAULT_WITH, DEFAULT_OPENER, CONFIG_PATH, TUIFI_THEME, load_theme
+from        .host import ManagerContext, ProcessTerminalHost, EmbeddedTerminalHost, ProcessSignalBroker, NullSignalBroker
 import   subprocess
 import    unicurses
-import     warnings
 import       shutil
 import       signal
 import         json
@@ -88,50 +88,80 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
     show_hidden(bool , optional): Show hidden files (you can toggle them by using CTRL+H or use tuifi_show_hidden)
     """
 
-    _instance_count = 0
     double_click_DELAY = 0.4
 
     def __init_variables(self):
-        self.files              = []
-        self.directory          = '.'
-        self.__count_selected   = 0
-        self.vim_mode           = False
-        self.info_label         = None
-        self.basename           = ''
-        self.is_in_command_mode = False
+        self.files                   = []
+        self.directory               = '.'
+        self.__count_selected        = 0
+        self.vim_mode                = False
+        self.info_label              = None
+        self.basename                = ''
+        self.is_in_command_mode      = False
+        self.__is_cut                = False
+        self.is_order_reversed       = False
+        self.__keep_search_results   = False
+        self.__is_opening_previous_dir = False
         self.__init_variables_for_find_mode   ()
         self.__init_event_variables_and_mouse ()
         self.__init_varibles_for_rename       ()
         self.__init_variables_for_find_mode   ()
 
 
+    @property
+    def directory(self):
+        """Absolute filesystem base directory (instance-owned context)."""
+        return self.ctx.base_directory
+
+    @directory.setter
+    def directory(self, path):
+        self.ctx.base_directory = path
+
+
     def info_label_clicked(self, *args):
         self.info_label._text = " COPIED DIRECTORY ON CLIPBOARD" if clipboard(self.directory) else " FAILED TO COPY DIRECTORY ON CLIPBOARD"
 
 
-    def __init__(self, y=0, x=0, height=30, width=45, anchor=(False,False,False,False), path=HOME_DIR, suffixes=[], sort_by=None, has_label=True, win=None, draw_files=True, termux_touch_only=True, auto_find_on_typing=True, auto_cmd_on_typing=False, vim_mode=False, is_focused=False, show_hidden=False):
+    def __init__(self, y=0, x=0, height=30, width=45, anchor=(False,False,False,False), path=HOME_DIR, suffixes=[], sort_by=None, has_label=True, win=None, draw_files=True, termux_touch_only=True, auto_find_on_typing=True, auto_cmd_on_typing=False, vim_mode=False, is_focused=False, show_hidden=False, *, embedded=None, context=None, host=None, signals=None, auto_start=None):
         load_theme()
-        TUIFIManager._instance_count += 1
+
+        # Hosting mode: any explicit injection implies embedded component
+        # usage; plain old-style construction keeps standalone-CLI behavior.
+        if embedded is None:
+            embedded = context is not None or host is not None or signals is not None
+        if context is None: context = ManagerContext()
+        if host    is None: host    = EmbeddedTerminalHost() if embedded else ProcessTerminalHost()
+        if signals is None: signals = NullSignalBroker()     if embedded else ProcessSignalBroker()
+        if auto_start is None: auto_start = not embedded
+
+        self.ctx             = context
+        self._host           = host
+        self._signals        = signals
+        self._started        = False
+        self._disposed       = False
+        self._warning_token  = None
+        self._signal_tokens  = []
+        self.command_events  = {}
+        self.has_label       = has_label
         self.__init_variables()
 
         if has_label:
             height -= 1
-            self.labelpad            = WindowPad(win,y+height,0,1,width, (False,anchor[1],anchor[2],anchor[3]))
+            self.labelpad            = WindowPad(win,y+height,0,1,width, (False,anchor[1],anchor[2],anchor[3]), mouse_cache=self.ctx.mouse)
             self.info_label          = Label(self.labelpad,0, 0, f'{f" {TUIFI_THEME} |" if TUIFI_THEME else ""} TUIFIManager {__version__} | Powered by uni-curses | + Donators: @Naheel-Azawy, @cargilcm, Johann-F Weber.', 1, width, (False,anchor[1],anchor[2],anchor[3]), False, COLOR_PAIR_BW)
             self.info_label.style    = unicurses.A_REVERSE | unicurses.A_BOLD
             self.info_label.on_click = self.info_label_clicked
-            warnings.showwarning     = self.custom_warning_handler
 
-        super().__init__(win, y, x, height, width, anchor, is_focused)
+        super().__init__(win, y, x, height, width, anchor, is_focused, mouse_cache=self.ctx.mouse)
         self.__order_method      = sort_by
         self.suffixes            = suffixes
         self.draw_files          = draw_files
         self.termux_touch_only   = termux_touch_only
-        self.auto_find_on_typing = os.getenv('tuifi_auto_find_on_typing'   , str(auto_find_on_typing)) == 'True' 
-        self.auto_cmd_on_typing  = os.getenv('tuifi_auto_command_on_typing', str(auto_cmd_on_typing )) == 'True' 
-        self.show_hidden         = os.getenv('tuifi_show_hidden'           , str(    show_hidden    )) == 'True' 
-        self.properties          = TUIProps ()
-        self.menu                = TUIMenu  (on_choice=self.on_menu_choice ,
+        self.auto_find_on_typing = os.getenv('tuifi_auto_find_on_typing'   , str(auto_find_on_typing)) == 'True'
+        self.auto_cmd_on_typing  = os.getenv('tuifi_auto_command_on_typing', str(auto_cmd_on_typing )) == 'True'
+        self.show_hidden         = os.getenv('tuifi_show_hidden'           , str(    show_hidden    )) == 'True'
+        self.properties          = TUIProps (mouse_cache=self.ctx.mouse)
+        self.menu                = TUIMenu  (on_choice=self.on_menu_choice , mouse_cache=self.ctx.mouse,
             items=(
                 'Open       │ ENTER' ,
                 'Cut        │ CTRL+X',
@@ -149,8 +179,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         self.load_markers       ()
         self.load_commands      ()
         self.__set_normal_events()
-        if not IS_WINDOWS and stty_a('^Z') : signal.signal(signal.SIGTSTP, self.suspend_proccess)
-        if     IS_WINDOWS or  stty_a('^C') : signal.signal(signal.SIGINT , self.copy            ) # https://docs.microsoft.com/en-us/windows/console/ctrl-c-and-ctrl-break-signals
+        if auto_start: self.start()
         if os.getenv('tuifi_vim_mode', str(vim_mode)) == 'True'   : self.toggle_vim_mode()
         if IS_DRAG_N_DROP: self.drag_and_drop = SyntheticXDND(self.handle_gui_to_tui_dropped_file, self.__get_selected_files) #NOTE: https://stackoverflow.com/a/14829479/11465149
 
@@ -168,6 +197,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __load(self, path, draw_files, suffixes):
+        path = os.path.abspath(os.path.expanduser(path))
         if os.path.exists(path):
             self.directory = os.path.normpath(path)
             if os.path.isfile(path):
@@ -180,7 +210,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def custom_warning_handler(self, message, category, filename, lineno, file=None, line=None):
-        if "g_main_context_pop_thread_default: assertion" in str(message) :return # SyntheticXDND
+        if "g_main_context" in str(message) :return # SyntheticXDND noise
         self.info_label.color_pair = 3
         self.info_label.style = unicurses.A_BOLD
         if category.__name__ == SyntaxWarning.__name__:
@@ -192,26 +222,87 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def suspend_proccess(self, signum, frame): # Kinda SuS but you know the deal...
-        print(END_MOUSE)
-        with self.suspend():
+        self._host.write(END_MOUSE + '\n')
+        with self._host.suspended():
             os.kill(os.getpid(), signal.SIGSTOP)
-        print(BEGIN_MOUSE)
-        unicurses.clear()
+        self._host.write(BEGIN_MOUSE + '\n')
+        self._host.clear_screen()
+
+
+    def _flush_persistent_state(self, cd=False):
+        """Write this instance's own state to its configured locations."""
+        if cd or HAS_CD_ON_ESC:
+            with open(f'{TEMP_PATH}tuifi_last_path.txt', 'w') as file:
+                file.write(self.directory)
+        self.save_markers()
+        self.save_order  ()
 
 
     def save_last_state(self, cd=False):
-        TUIFIManager._instance_count -= 1
-        if TUIFIManager._instance_count == 0:
-            if cd or HAS_CD_ON_ESC:
-                with open(f'{TEMP_PATH}tuifi_last_path.txt', 'w') as file:
-                    file.write(self.directory)
-            self.save_markers()
-            self.save_order  ()
+        """Compatibility alias: flush state without restoring process hooks."""
+        self._flush_persistent_state(cd)
+
+
+    def start(self):
+        """Install the process-level resources this manager is allowed to own.
+
+        Idempotent: only the first call registers anything.  Embedded
+        managers (EmbeddedTerminalHost + NullSignalBroker) register nothing
+        process-global even when started.
+        """
+        if self._started:
+            return self
+        self._started = True
+
+        if self.has_label:
+            token = self._host.install_warning_handler(self.custom_warning_handler)
+            if token is not None:
+                self._warning_token = token
+
+        if not IS_WINDOWS and stty_a('^Z'):
+            token = self._signals.install(signal.SIGTSTP, self.suspend_proccess)
+            if token is not None:
+                self._signal_tokens.append(token)
+        if IS_WINDOWS or stty_a('^C'):
+            token = self._signals.install(signal.SIGINT, self.copy) # https://docs.microsoft.com/en-us/windows/console/ctrl-c-and-ctrl-break-signals
+            if token is not None:
+                self._signal_tokens.append(token)
+        return self
+
+
+    def dispose(self, cd=False):
+        """Idempotently restore resources registered by this instance.
+
+        A second (or later) call does nothing.  Only signal/warning tokens
+        captured by this instance are restored; the instance's own markers
+        and ordering are flushed before restoration.
+        """
+        if self._disposed:
+            return
+        self._disposed = True
+
+        self._flush_persistent_state(cd)
+
+        for token in self._signal_tokens:
+            self._signals.restore(token)
+        self._signal_tokens = []
+
+        if self._warning_token is not None:
+            self._host.restore_warning_handler(self._warning_token)
+            self._warning_token = None
+
 
     def __del__(self):
-        self.save_last_state()
+        try:
+            self.dispose()
+        except Exception:
+            pass
 
-    def __handle_garbage(self): self.__del__()
+
+    def __handle_garbage(self):
+        # ESC pressed: persist state only.  The host may keep using this
+        # component, so hook restoration belongs to dispose(), not here.
+        self.save_last_state()
 
 
     def __handle_focus_on_previour_dir(self, f, i):
@@ -244,7 +335,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
             count = 0
             temp_profile = TUIFIProfiles.get(':empty_folder')
             for suffix in ['/', *self.suffixes] if self.suffixes else ['']: # TODO: Make sure there's no Potential Windows issue? 
-                for f in Path(file_directory + sep).glob('*'+suffix): # thankfully is a generator
+                for f in Path(file_directory).glob('*'+suffix): # absolute path, generator
                     count +=1
                     if count == 2:
                         return TUIFIProfiles.get(':folder')
@@ -306,7 +397,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
                 return self.__temp_find_filename in name.lower()
             else:
                 return self.__temp_find_filename in name
-        if self.suffixes and os.path.isfile(self.directory + sep + name):
+        if self.suffixes and os.path.isfile(os.path.join(self.directory, name)):
             for s in self.suffixes:
                 if name.endswith(s): return True
             return False
@@ -314,9 +405,9 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __load_file(self, name):
-        is_link      = os.path.islink(self.directory + sep + name)
+        is_link      = os.path.islink(os.path.join(self.directory, name))
         filename     = name
-        file_        = TUIFile(filename, self.___y, self.___x, self.get_profile(self.directory + sep + name), is_link=is_link)
+        file_        = TUIFile(filename, self.___y, self.___x, self.get_profile(os.path.join(self.directory, name)), is_link=is_link)
         self.files.append(file_)
         self.__set_coordinates(file_)
 
@@ -338,8 +429,9 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         self.files = []
         self.__reset_coordinates()
         self.__load_file('..')
-        os.chdir(directory)
-        for f in sorted(os.listdir(), key=order[0], reverse=order[1]): # key=os.path.getctime): # os.listdir(directory):
+        self._host.set_working_dir(directory)
+        sort_key = None if order[0] is None else lambda f: order[0](os.path.join(directory, f))
+        for f in sorted(os.listdir(directory), key=sort_key, reverse=order[1]): # names resolve against absolute directory
             if not self.__is_valid_file(f): continue
             self.__load_file(f)
 
@@ -371,7 +463,6 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         return self.files
 
 
-    __keep_search_results = False # really bad practice but whatever lol (and i can't take advantage of is_in_find_mode because of error when moving files that ...)
     def reload(self,draw_files=True, keep_search_results=False):
         if not keep_search_results:
             self.__temp_find_filename = ''
@@ -395,11 +486,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         """
         Suspend curses in order to open another subprocess in the terminal.
         """
-        try:
-            unicurses.endwin()
+        with self._host.suspended():
             yield
-        finally:
-            unicurses.doupdate()
 
 
     def __try_open_with(self, directory: str, open_with: Optional[str], multiple=False) -> None:
@@ -408,22 +496,22 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         dirs = []
         if multiple: # puke-able shit lol xD, sorry for that
             for f in self.files: # TODO: Save selected to a temp list becuase this is really costy! (decisions..) 
-                if f.is_selected: 
+                if f.is_selected:
                     if f.profile.open_with != DEFAULT_OPENER:
-                        dirs.append(self.directory+sep+f.name)
+                        dirs.append(os.path.join(self.directory, f.name))
                         open_with = DEFAULT_WITH
                     else:
-                        self.__try_open_with(self.directory+sep+f.name, f.profile.open_with )
+                        self.__try_open_with(os.path.join(self.directory, f.name), f.profile.open_with)
         else:
             dirs = [directory]
 
         if not dirs: return # Although not needed just in case for other DEFAULT_OPENERs
 
-        print(END_MOUSE, end='\r')
+        self._host.write(END_MOUSE + '\r')
         with self.suspend():
             proc = subprocess.Popen([open_with, *dirs], shell=IS_WINDOWS) # TODO: optional stdout=subprocess.DEVNULL when I'll add loading TUIFIProfiles from external file ?
             proc.wait()
-        print(BEGIN_MOUSE, end='\r')
+        self._host.write(BEGIN_MOUSE + '\r')
         return
 
 
@@ -455,7 +543,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
             return None
 
         if isinstance(directory, TUIFile):
-            directory = self.directory + sep + directory.name
+            directory = os.path.join(self.directory, directory.name)
 
         if basename(directory) == '..':
             self.__is_opening_previous_dir = True
@@ -589,7 +677,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         def get_available_filename(self,name):
             tmp_name = name
             i = 0
-            while os.path.isfile(self.directory + sep + tmp_name):
+            while os.path.isfile(os.path.join(self.directory, tmp_name)):
                 tmp_name = f'{i}_{name}'
                 i += 1
             return tmp_name
@@ -637,10 +725,10 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
                 f_list = []
                 for f in self.files:
                     if f.is_selected:
-                        f_list.append(QUrl.fromLocalFile(self.directory + sep + f.name))
+                        f_list.append(QUrl.fromLocalFile(os.path.join(self.directory, f.name)))
                 return f_list
             elif self.__pre_pressed_file:
-                return [QUrl.fromLocalFile(self.directory + sep + self.__pre_pressed_file.name)]
+                return [QUrl.fromLocalFile(os.path.join(self.directory, self.__pre_pressed_file.name))]
 
 
         def handle_gui_to_tui_dropped_file(self, file_url, type): #TODO: Custom user actions on link patterns: eg. clone git, save at folder xy, etc. + TODO: if dropped on folder
@@ -648,12 +736,12 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
             self.__set_label_text(f'DROPPED: {file_url}')
             if type == 1:
                 name = os.path.basename(file_url)
-                shutil.move(file_url, self.directory + sep + name)
+                shutil.move(file_url, os.path.join(self.directory, name))
                 self.__sub_handle_creation_of(name, self.get_profile(file_url)) # TODO: for other non \file_extensions
                 self.__set_label_text(f'MOVED: {name}')
                 self.refresh() #for some reason refresh is needed that's SuS. Should look on download too
             elif type == 0:
-                self.download(file_url, self.directory + sep)
+                self.download(file_url, os.path.join(self.directory, ''))
             elif file_url.startswith('data:') and not file_url.find('base64') == -1:
                 extension = mimetypes.guess_extension(file_url.split(';')[0].split(':')[1])
                 filename = self.get_available_filename('download'+extension)
@@ -684,14 +772,14 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def exit_to_self_directory(self):
-        print(END_MOUSE)
+        self._host.write(END_MOUSE + '\n')
         unicurses.endwin()
-        self.save_last_state(cd=True) # it's self.__handle_garbage() but eew!
+        self.dispose(cd=True) # flush + restore what this instance registered
         exit()
 
 
     def load_order(self, path=CONFIG_PATH):
-        path = path + sep + 'ORDER.csv'
+        path = os.path.join(path, 'ORDER.csv')
         if not os.path.isfile(path) : return
         tmp_order_methods = {
             'getctime' : os.path.getctime,
@@ -703,23 +791,22 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         with open(path, 'r') as file:
             for d in file:
                 d = d.split(',')
-                TUIFIManager.ordered_dirs[d[0]] = (tmp_order_methods[d[1]], True if d[2][:-1] == 'True' else False) # -1 to remove newline
+                self.ctx.ordered_dirs[d[0]] = (tmp_order_methods[d[1]], True if d[2][:-1] == 'True' else False) # -1 to remove newline
 
 
     def save_order(self, path=CONFIG_PATH):
-        if not TUIFIManager.__ordered_dirs_need_saving: return # prevent unnecessary saving
-        with open(path + sep + 'ORDER.csv','w') as fp:
-            for k, v in TUIFIManager.ordered_dirs.items():
+        if not self.ctx.order_dirty: return # prevent unnecessary saving
+        with open(os.path.join(path, 'ORDER.csv'),'w') as fp:
+            for k, v in self.ctx.ordered_dirs.items():
                 if os.path.isdir(k):
                     fp.write(k + ',' + (v[0].__name__ if v[0] else 'none') + f',{v[1]}\n')
 
 
     def get_order_of(self, directory):
-        tmp_ordered_dir = TUIFIManager.ordered_dirs.get(directory)
+        tmp_ordered_dir = self.ctx.ordered_dirs.get(directory)
         return (None, False) if not tmp_ordered_dir else tmp_ordered_dir
 
 
-    is_order_reversed = False
     def ascend_order_switch(self, order_method=None):
         if not self.is_order_reversed: order_method = self.__order_method
         self.is_order_reversed = True
@@ -732,11 +819,9 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         self.switch_order_method(order_method)
 
 
-    __ordered_dirs_need_saving = False
-    ordered_dirs = {}
     def switch_order_method(self, order_method=None):
-        TUIFIManager.__ordered_dirs_need_saving = True
-        if order_method: 
+        self.ctx.order_dirty = True
+        if order_method:
             self.__order_method = order_method
             self.__set_label_text(('[▼] DESCENDING' if self.is_order_reversed else '[▲] ASCENDING') + ' ORDER')
         elif self.__order_method == None:
@@ -755,10 +840,10 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
             self.__order_method = None # oreder default
             self.__set_label_text(('[▼]' if self.is_order_reversed else '[▲]') + '[ORDERED] BY NAME')
 
-        if not self.is_order_reversed and self.__order_method == None: # prevent default mode to be saved 
-            if TUIFIManager.ordered_dirs.get(self.directory): del TUIFIManager.ordered_dirs[self.directory]
+        if not self.is_order_reversed and self.__order_method == None: # prevent default mode to be saved
+            if self.ctx.ordered_dirs.get(self.directory): del self.ctx.ordered_dirs[self.directory]
         else:
-            TUIFIManager.ordered_dirs[self.directory] = (self.__order_method, self.is_order_reversed)
+            self.ctx.ordered_dirs[self.directory] = (self.__order_method, self.is_order_reversed)
 
         self.reload()
 
@@ -783,10 +868,6 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
         self.__index_of_alt_clicked_file     = None
         self.__index_of_pressed_file         = None
-
-
-    __temp__copied_files       = []
-    __temp_dir_of_copied_files = ''
 
 
     def __set_normal_events(self):
@@ -887,6 +968,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         if self.info_label:
             self.info_label.color_pair = color_pair
             self.info_label._text = text
+        if self.ctx.prompt_sink is not None:
+            self.ctx.prompt_sink(text, color_pair)
 
 
     if IS_TERMUX:
@@ -916,7 +999,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
     def __delete_file(self,file):
         if isinstance(file, TUIFile):
-            file = self.directory + sep + file.name
+            file = os.path.join(self.directory, file.name)
         elif not isinstance(file, str):
             raise TypeError('TUIFileTypeError: file must be of type string or TUIFile.')
         return self.__attempt_deletion(file)
@@ -943,7 +1026,6 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         return True
 
 
-    __is_cut = False
     def cut(self):
         """
         Cut-copies the selected files | Not fully implemented yet
@@ -962,8 +1044,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __set_label_on_copy(self,size):
-        length = len(TUIFIManager.__temp__copied_files)
-        text   = f'{length} files [~{convert_bytes(size)}]' if length > 1 else f'{TUIFIManager.__temp__copied_files[0].name}'
+        length = len(self.ctx.copied_files)
+        text   = f'{length} files [~{convert_bytes(size)}]' if length > 1 else f'{self.ctx.copied_files[0].name}'
         action = 'CUTED' if self.__is_cut else 'COPIED'
         self.__set_label_text(f'[{action}]: {text}', COLOR_PAIR_GREEN)
 
@@ -975,22 +1057,22 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         """
         if self.__count_selected == 0 or (self.__clicked_file and self.__clicked_file.name == '..') : return
         size = 0
-        TUIFIManager.__temp_dir_of_copied_files = self.directory
+        self.ctx.copied_from_dir = self.directory
         if self.__count_selected == 1:
-            TUIFIManager.__temp__copied_files = [self.__clicked_file]
+            self.ctx.copied_files = [self.__clicked_file]
         else:
-            TUIFIManager.__temp__copied_files = []
+            self.ctx.copied_files = []
             for f in self.files:
                 if f.is_selected:
-                    TUIFIManager.__temp__copied_files.append(f)
-                    size += os.path.getsize(self.directory + sep + f.name)
+                    self.ctx.copied_files.append(f)
+                    size += os.path.getsize(os.path.join(self.directory, f.name))
         self.__set_label_on_copy(size)
 
 
     def __duplicate(self):
-        for f in TUIFIManager.__temp__copied_files:
-            source      = TUIFIManager.__temp_dir_of_copied_files + sep + f.name
-            destination = self.directory + sep
+        for f in self.ctx.copied_files:
+            source      = os.path.join(self.ctx.copied_from_dir, f.name)
+            destination = self.directory
             i = 1
             if os.path.isfile(source):        # Does 'file' exist?
                 method_copy = shutil.copyfile
@@ -1000,15 +1082,15 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
                 exists      = os.path.isdir
             else:                             # if source doesn't exist continue with loop
                 continue
-            while exists(f'{destination}{i}_{f.name}'):
+            while exists(os.path.join(destination, f'{i}_{f.name}')):
                 i += 1
-            method_copy(source, f'{destination}{i}_{f.name}')
-                
+            method_copy(source, os.path.join(destination, f'{i}_{f.name}'))
+
 
     def __copy_cut(self):
-        for f in TUIFIManager.__temp__copied_files:
-            source      = TUIFIManager.__temp_dir_of_copied_files + sep + f.name
-            destination = self.directory                  + sep + f.name
+        for f in self.ctx.copied_files:
+            source      = os.path.join(self.ctx.copied_from_dir, f.name)
+            destination = os.path.join(self.directory, f.name)
             if os.path.isfile(source):   # Does 'file' exist?
                 if not self.__is_cut: shutil.copyfile(source, destination, follow_symlinks=False)
                 else                : shutil.move    (source, destination)
@@ -1022,8 +1104,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         Pastes the already selected and copied/cutted files.
         """
         if not self.has_write_access(self.directory): return
-        if len(TUIFIManager.__temp__copied_files) == 0 or not os.path.exists(TUIFIManager.__temp_dir_of_copied_files): return # u never no if the user deleted anything from other file manager this is also something i haven't consider for the rest of the things and [...]
-        if TUIFIManager.__temp_dir_of_copied_files != self.directory: self.__copy_cut ()
+        if len(self.ctx.copied_files) == 0 or not os.path.exists(self.ctx.copied_from_dir): return # source may have been removed elsewhere
+        if self.ctx.copied_from_dir != self.directory: self.__copy_cut ()
         else : self.__duplicate()
         self.reload(keep_search_results=True)
 
@@ -1085,16 +1167,16 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def load_markers(self, path=CONFIG_PATH):
-        path = path + sep + 'MARKERS'
+        path = os.path.join(path, 'MARKERS')
         if not os.path.isfile(path) : return
         with open(path, 'r') as file:
-            TUIFIManager.markers = json.load(file)
+            self.ctx.markers = json.load(file)
 
 
     def save_markers(self, path=CONFIG_PATH):
-        TUIFIManager.markers['`'] = self.directory
-        with open(path + sep + 'MARKERS','w') as fp:
-            fp.write(json.dumps(TUIFIManager.markers))
+        self.ctx.markers['`'] = self.directory
+        with open(os.path.join(path, 'MARKERS'),'w') as fp:
+            fp.write(json.dumps(self.ctx.markers))
 
 
     def __mark_file_as_currently_clicked(self, i):
@@ -1188,8 +1270,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __refine_path(self, path):
-        path = HOME_DIR       + path[1:] if path.startswith('~') else path
-        path = self.directory + path[1:] if path.startswith('.') else path 
+        path = os.path.join(HOME_DIR      , path[1:]) if path.startswith('~') else path
+        path = os.path.join(self.directory, path[1:]) if path.startswith('.') else path
         path = os.path.realpath(os.path.normpath(path))
         return path
 
@@ -1206,19 +1288,19 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __cmd_stack(self, pattern):
-        TUIFIManager.__temp__copied_files = []
+        self.ctx.copied_files = []
         size = 0
         if pattern:
             for e in self.files:
                 match = re.search(pattern, e.name)
                 if match:
-                    TUIFIManager.__temp__copied_files.append(e)
-                    size += os.path.getsize(self.directory + sep + e.name)
+                    self.ctx.copied_files.append(e)
+                    size += os.path.getsize(os.path.join(self.directory, e.name))
         elif self.__clicked_file:
-            size = os.path.getsize(self.directory + sep + self.__clicked_file.name)
-            TUIFIManager.__temp__copied_files = [self.__clicked_file]
-        if len(TUIFIManager.__temp__copied_files): 
-            TUIFIManager.__temp_dir_of_copied_files = self.directory
+            size = os.path.getsize(os.path.join(self.directory, self.__clicked_file.name))
+            self.ctx.copied_files = [self.__clicked_file]
+        if len(self.ctx.copied_files):
+            self.ctx.copied_from_dir = self.directory
             self.__set_label_on_copy(size)
         else:
             self.__set_label_text('FILES NOT FOUND', COLOR_PAIR_RED)
@@ -1238,7 +1320,6 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         pass
 
 
-    command_events = {}
     command_types  = { # TODO: maybe an open with sufixes?
         'delete' : __cmd_delete , 
         'open'   : __cmd_open   , 
@@ -1248,7 +1329,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
     }
     def load_commands(self, path=CONFIG_PATH):
         os.makedirs(path, exist_ok=True)
-        conf_path = path + sep + 'cmds.conf'
+        conf_path = os.path.join(path, 'cmds.conf')
         if not os.path.isfile(conf_path): 
             f = open(conf_path, 'w')
             f.write(
@@ -1264,7 +1345,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
             ln = line.strip()
             if ln == '': continue
             ln = line.split('|') #  command, args, type, comment | using "|" because this is an __illegal_filename_characters
-            TUIFIManager.command_events[ln[0].strip()] = (self.command_types[ln[1].strip()], ast.literal_eval('{'+ln[2].strip()+'}'), ln[3].strip())
+            self.command_events[ln[0].strip()] = (self.command_types[ln[1].strip()], ast.literal_eval('{'+ln[2].strip()+'}'), ln[3].strip())
         f.close()
 
 
@@ -1274,13 +1355,12 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
     def __ignore_escape(self): self.consume_escape_once()
 
-    markers = {}
     def __perform_hardcoded_cmd_events(self, event):
         character = unicurses.RCCHAR(event)
         if self.__temp_findname.startswith('y'):
             if len(self.__temp_findname) == 2:
                 if   character == 'p': 
-                    self.__set_label_text('[COPIED] File-path to clipboard'      if clipboard(str(self.directory+sep+self.__clicked_file.name if self.__clicked_file else self.directory)) else 'FAILD TO COPY TO CLIPBOARD')
+                    self.__set_label_text('[COPIED] File-path to clipboard'      if clipboard(str(os.path.join(self.directory, self.__clicked_file.name) if self.__clicked_file else self.directory)) else 'FAILD TO COPY TO CLIPBOARD')
                     self.__temp_findname = '' # to prevent blocking command mode I include those 2 lines 2 times, once here ...
                     self.__ignore_escape()
                 elif character == 'd': 
@@ -1333,7 +1413,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         elif self.__temp_findname.startswith('m'):
             self.__set_label_text('[MARKER]')
             if len(self.__temp_findname) == 2:
-                TUIFIManager.markers[character] = self.directory
+                self.ctx.markers[character] = self.directory
                 if self.__temp_findname[1] == 'm' and self.insert_jumplist(self.directory): 
                     self.__set_label_text(f'[MARKER] SET TO JUMPLIST AND [{character}]', COLOR_PAIR_GREEN)
                 else:
@@ -1344,7 +1424,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         elif self.__temp_findname.startswith(('`',';')):
             self.__set_label_text('[GOTO MARKER]')
             if len(self.__temp_findname) == 2:
-                path = TUIFIManager.markers.get(character)
+                path = self.ctx.markers.get(character)
                 if path:
                     self.deselect()
                     self.open(path) # scroll to file maby too?
@@ -1359,7 +1439,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def call_command(self,command):
-        cmd = TUIFIManager.command_events.get(command)
+        cmd = self.command_events.get(command)
         if not cmd: return False
         self.__change_escape_event_consumed = True # it has to be before cmd call
         cmd[0](self, **cmd[1])
@@ -1420,11 +1500,11 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         elif event in (unicurses.KEY_RIGHT, unicurses.CTRL('L')):
             if self.__temp_i != len(self.__temp_name): self.__temp_i += 1
         elif event in (27, unicurses.KEY_ENTER, 10) or (event == unicurses.KEY_MOUSE and ((self.get_mouse()[5] & unicurses.BUTTON1_PRESSED) or (self.get_mouse()[5] & unicurses.BUTTON3_PRESSED))):
-            new_path_name                       = self.directory + sep + self.__temp_name
+            new_path_name                       = os.path.join(self.directory, self.__temp_name)
             self.__temp_i                       = 0
             self.__change_escape_event_consumed = True
             if  event != 27 and self.__temp_name.strip() != '' and not os.path.exists(new_path_name):
-                os.rename(self.directory + sep + self.__clicked_file.name, new_path_name)
+                os.rename(os.path.join(self.directory, self.__clicked_file.name), new_path_name)
                 self.__set_label_text(f'RENAMED: "{self.__clicked_file.name}" to "{self.__temp_name}"', COLOR_PAIR_GREEN)
                 self.__clicked_file.name    = self.__temp_name
                 self.__clicked_file.profile = self.get_profile(new_path_name)
@@ -1476,15 +1556,15 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         i, j = '', 0
         exists = os.path.isdir if _type == 'folder' else os.path.isfile
 
-        while exists(self.directory + sep + 'New ' + _type + i):
+        while exists(os.path.join(self.directory, 'New ' + _type + i)):
             i = f' ({str(j)})'
             j += 1
         filename = f'New {_type}{i}'
         if _type == 'folder':
-            os.mkdir(self.directory + sep + filename)
+            os.mkdir(os.path.join(self.directory, filename))
             _type = 'empty_folder'
         else                :
-            open(self.directory + sep + filename, 'w').close()
+            open(os.path.join(self.directory, filename), 'w').close()
 
         self.__sub_handle_creation_of(filename, TUIFIProfiles.get(f':{_type}'))
         self.rename()
@@ -1500,7 +1580,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
         if not self.info_label: return
         file = file if file else self.__clicked_file
         index= index if index else self.__index_of_clicked_file
-        path = self.directory + sep + file.name
+        path = os.path.join(self.directory, file.name)
         info = f'[{convert_bytes(os.path.getsize(path))}]' if os.path.isfile(path) else ''
         offset = self.__int_len(max(len(self.files),999)) + 3 + self.__int_len(index) + 3 + len(info) + 2
         self.info_label.text = f'[{len(self.files) - 1:04}] [{index}] {path[max(len(path) - self.info_label.width + offset, 0):]} {info}'
@@ -1650,13 +1730,14 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
                         self.escape_event_consumed = False
                         self.open(self.__clicked_file)
                 elif self.__clicked_file and self.__mouse_btn1_pressed_file and not self.__mouse_btn1_pressed_file == self.__clicked_file and not self.__clicked_file.is_selected: # this `and not self.__clicked_file.is_selected:` was needed because __clicked_file isn't marked as selected until "drop event" ends | tldr prevents from dropping files into itself
-                    if os.path.isdir(self.directory + sep + self.__clicked_file.name) and self.has_write_access(self.directory) and self.has_write_access(self.directory + sep + self.__clicked_file.name):
+                    clicked_dir = os.path.join(self.directory, self.__clicked_file.name)
+                    if os.path.isdir(clicked_dir) and self.has_write_access(self.directory) and self.has_write_access(clicked_dir):
                         i=0 # taken from __delete_multiple_selected_file
                         folder_index = None
                         while True:
                             if self.files[i].is_selected: # first file is never selected because it is the .. one
                                 fname = self.files[i].name
-                                shutil.move(self.directory + sep + fname, self.directory + sep + self.__clicked_file.name + sep + fname)
+                                shutil.move(os.path.join(self.directory, fname), os.path.join(self.directory, self.__clicked_file.name, fname))
                                 self.__count_selected -=1
                                 del self.files[i]
                                 i-=1
@@ -1778,7 +1859,7 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __navigate_to_previous_dir(self):
-        self.navigate(self.directory + sep + '..')
+        self.navigate(os.path.join(self.directory, '..'))
 
 
     def __open_DEFAULT_WITH(self): # opens folder 
@@ -1837,8 +1918,8 @@ class TUIFIManager(WindowPad):  # TODO: I need to create a TUIWindowManager clas
 
 
     def __perform_key_btab(self): # TODO: Multiple files shifttab if needed
-        if self.__clicked_file and self.__clicked_file.name != '..' and self.has_write_access(self.directory) and self.has_write_access(self.directory + sep + '..'):
-            shutil.move(self.directory + sep + self.__clicked_file.name, self.directory + sep + '..' + sep + self.__clicked_file.name)
+        if self.__clicked_file and self.__clicked_file.name != '..' and self.has_write_access(self.directory) and self.has_write_access(os.path.join(self.directory, '..')):
+            shutil.move(os.path.join(self.directory, self.__clicked_file.name), os.path.join(self.directory, '..', self.__clicked_file.name))
             temp_i = self.__index_of_clicked_file - 1
             self.reload()
             self.__index_of_clicked_file = temp_i

@@ -16,8 +16,8 @@ class TUIMenu(WindowPad): # TODO: fix alt+down in __init__.py i think when no fi
     # x    , y      = 0 , 0
     # width, height = 20, 15
 
-    def __init__(self, items, border=Border(), on_choice=lambda *args : None ):
-        super().__init__(border=border, height=len(items) + 2, width=len(max(items, key=len)) + 4)
+    def __init__(self, items, border=Border(), on_choice=lambda *args : None, mouse_cache=None ):
+        super().__init__(border=border, height=len(items) + 2, width=len(max(items, key=len)) + 4, mouse_cache=mouse_cache)
         # self.parent = unicurses.stdscr
         self.exists = False
         self.items = items

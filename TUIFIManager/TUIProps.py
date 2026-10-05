@@ -25,8 +25,8 @@ def convert_bytes(num): #WARN: https://stackoverflow.com/a/63839503/11465149 | h
 
 
 class TUIProps(WindowPad):
-    def __init__(self, border=Border(), on_choice=lambda *args : None ):
-        super().__init__(border=border, height=12+VISIBLE_FILENAME_LINES, width=35, anchor=(True, True, True, True))
+    def __init__(self, border=Border(), on_choice=lambda *args : None, mouse_cache=None ):
+        super().__init__(border=border, height=12+VISIBLE_FILENAME_LINES, width=35, anchor=(True, True, True, True), mouse_cache=mouse_cache)
         # self.is_locked = False
         unicurses.wbkgd(self.pad,unicurses.COLOR_PAIR(9))
         self.maxheight = 12 + VISIBLE_FILENAME_LINES
@@ -131,7 +131,7 @@ class TUIProps(WindowPad):
         fnum = 0
         for tfl in tuifiles:
             if not tfl.is_selected: continue
-            self.path = f'{directory}{sep}{tfl.name}'
+            self.path = join(directory, tfl.name)
             info = stat(self.path)
 
             if M_dt < info.st_mtime: M_dt = info.st_mtime
@@ -160,7 +160,7 @@ class TUIProps(WindowPad):
         self.label1._text = "INODE" 
         self.open_with = tuifile.profile.open_with if tuifile.profile.open_with else "TUIFI"
         self.label8._text = basename(self.open_with) 
-        self.path = f'{directory}{sep}{tuifile.name}'
+        self.path = join(directory, tuifile.name)
         info = stat(self.path)
         self.bytes = 0
         fnum = 0

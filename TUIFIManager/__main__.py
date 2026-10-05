@@ -58,6 +58,7 @@ def main():
         uc.refresh()
     print(END_MOUSE)
     uc.endwin()
+    fileManager.dispose() # standalone shell owns the process-level hooks
 
 
 if __name__ == "__main__":
